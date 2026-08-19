@@ -5,6 +5,12 @@ Magic Mouse -> vrai clic (et glissé maintenu) du bouton du milieu, pensé
 pour un usage type navigation 3D / CAD (Fusion 360...), pas juste un clic
 bref.
 
+## Licence
+
+Copyright © 2026 Evolupt
+
+Publié sous licence [Apache 2.0](LICENSE).
+
 ## Pourquoi cette architecture (2e version)
 
 Une première version se basait uniquement sur `CGEventTap` (intercepter
