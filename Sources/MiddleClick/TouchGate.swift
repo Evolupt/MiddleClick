@@ -1,10 +1,10 @@
 import Foundation
 
 /// Surveille en continu le nombre de doigts posés sur la surface tactile
-/// (Magic Mouse / trackpad) et prévient quand le seuil configuré est
-/// franchi dans un sens ou dans l'autre. Ne connaît rien aux clics/CGEvent —
-/// c'est un simple "portillon" ouvert/fermé sur lequel `MiddleClickEngine`
-/// se branche.
+/// (Magic Mouse / trackpad) et expose un simple état `isOpen` — pas de
+/// callback : `MiddleClickEngine` lit cet état de façon synchrone, une
+/// seule fois, au moment précis d'un clic (voir MiddleClickEngine.swift
+/// pour le pourquoi de ce choix plutôt qu'une réaction en temps réel).
 final class TouchGate {
 
     /// Nombre de doigts nécessaires pour considérer le portillon "ouvert".
@@ -14,12 +14,21 @@ final class TouchGate {
 
     /// États du champ `state` considérés comme un doigt "actif". On ne
     /// garde QUE `.touching` (contact franc) : les états de transition
-    /// (`.makingContact` / `.breakingContact`) sont plus sujets au bruit —
-    /// un simple glissement pendant un clic gauche peut faire "voir"
-    /// transitoirement 2 contacts et déclencher une fusion à tort.
+    /// (`.makingContact` / `.breakingContact`) sont plus sujets au bruit.
     var activeStates: Set<Int32> = [
         MTTouchState.touching.rawValue
     ]
+
+    /// Surface de contact minimale (champ `size` de `MTTouch`) pour qu'un
+    /// doigt compte comme "vraiment posé". La détection brute par état
+    /// seul peut être très sensible (un effleurement léger compte comme un
+    /// contact) ; ce seuil permet de filtrer ça. Unité brute du capteur
+    /// (pas documentée par Apple) — 0 = pas de filtrage. Pour calibrer,
+    /// passe `Debug.verbose = true` : chaque changement de nombre de
+    /// doigts affiche aussi la taille brute de chaque contact, ce qui
+    /// permet de repérer où mettre le seuil (une vraie pression du doigt
+    /// donne une taille nettement plus grande qu'un effleurement).
+    var minimumContactSize: Float = 0
 
     /// Le nombre de doigts doit rester ≥ `threshold` pendant cette durée
     /// avant que le portillon ne s'ouvre réellement — filtre les blips
@@ -27,10 +36,10 @@ final class TouchGate {
     /// de latence perceptible sur un vrai geste à 2 doigts maintenu.
     var openConfirmDelay: TimeInterval = 0.05
 
-    var onGateOpen: (() -> Void)?
-    var onGateClose: (() -> Void)?
-
     private(set) var isOpen = false
+    /// Dernier nombre de doigts actifs mesuré (après filtrage état + taille).
+    private(set) var currentCount = 0
+
     private var devices: [MTDeviceRef] = []
     private var lastLoggedCount = -1
     private var pendingOpenWorkItem: DispatchWorkItem?
@@ -88,14 +97,23 @@ final class TouchGate {
             deviceStop(device)
         }
         devices.removeAll()
+        pendingOpenWorkItem?.cancel()
+        pendingOpenWorkItem = nil
+        isOpen = false
+        currentCount = 0
     }
 
     /// Appelé depuis le callback C, déjà sur le thread principal.
     fileprivate func handleFrame(touches: [MTTouch]) {
-        let count = touches.filter { activeStates.contains($0.state) }.count
+        let active = touches.filter {
+            activeStates.contains($0.state) && $0.size >= minimumContactSize
+        }
+        let count = active.count
+        currentCount = count
 
         if count != lastLoggedCount {
-            debugLog("doigts actifs = \(count) (états bruts: \(touches.map { $0.state }))")
+            let sizes = touches.map { String(format: "%.2f", $0.size) }
+            debugLog("doigts actifs = \(count) (états bruts: \(touches.map { $0.state }), tailles brutes: \(sizes))")
             lastLoggedCount = count
         }
 
@@ -109,19 +127,14 @@ final class TouchGate {
             let work = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
                 self.pendingOpenWorkItem = nil
-                guard !self.isOpen else { return }
                 self.isOpen = true
-                self.onGateOpen?()
             }
             pendingOpenWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + openConfirmDelay, execute: work)
         } else {
             pendingOpenWorkItem?.cancel()
             pendingOpenWorkItem = nil
-            if isOpen {
-                isOpen = false
-                onGateClose?()
-            }
+            isOpen = false
         }
     }
 

@@ -3,50 +3,56 @@ import ApplicationServices
 import IOKit.hid
 
 /// Fusionne un clic (et un glissé maintenu) gauche/droite en clic du bouton
-/// du milieu, en s'appuyant sur `TouchGate` comme signal déclencheur plutôt
-/// que sur une fenêtre de temps entre deux clics.
+/// du milieu, en s'appuyant sur `TouchGate` comme simple lecture d'état AU
+/// MOMENT DU CLIC — pas comme déclencheur réagissant en cours de geste.
 ///
-/// Principe :
-/// - Le portillon tactile (2 doigts posés) ouvre/ferme une porte.
-/// - Tant qu'un bouton gauche/droit réel est en train d'être pressé PENDANT
-///   que le portillon est ouvert, on intercepte tout (down / dragged / up)
-///   et on le retransforme en événements du bouton du milieu.
-/// - Si le portillon s'ouvre alors qu'un clic simple est déjà en cours
-///   (le firmware a déjà classé le clic avant que le 2e doigt soit détecté),
-///   on "corrige à chaud" : faux relâchement du bouton simple, puis vrai
-///   appui du bouton du milieu.
-/// - Aucun délai artificiel : tout est transmis immédiatement, sauf pendant
-///   une session fusionnée.
+/// Principe (verrouillage à l'appui) :
+/// - Au moment précis d'un `mouseDown` (gauche ou droit), on regarde combien
+///   de doigts sont posés à cet instant précis. Si le portillon tactile est
+///   ouvert (≥ 2 doigts), toute la pression (down / dragged / up) est
+///   convertie en clic du bouton du milieu, du début à la fin. Sinon, tout
+///   est transmis normalement.
+/// - Cette décision est prise UNE SEULE FOIS et reste VERROUILLÉE pour toute
+///   la durée de l'appui : les doigts peuvent ensuite se poser ou se lever
+///   sans rien changer, jusqu'au relâchement réel du bouton.
+///
+/// Ça évite deux problèmes symétriques rencontrés avec une version plus
+/// réactive : un doigt qui se pose par inadvertance en cours de glissement
+/// simple (annulait une sélection à tort), et un doigt qui se lève en cours
+/// de glissé milieu (coupait le drag milieu à tort — alors qu'on veut au
+/// contraire qu'il continue tant que le bouton physique reste enfoncé).
 final class MiddleClickEngine {
 
     private static let syntheticMarker: Int64 = 0x4D43 // "MC"
 
-    private let touchGate = TouchGate()
+    let touchGate = TouchGate()
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
-    private var realButtonDown: CGMouseButton?
     private var lastLocation: CGPoint = .zero
-    private var middleActive = false
+
+    /// `true` entre un mouseDown et son mouseUp correspondant.
+    private var pressLocked = false
+    /// Décidé une seule fois à l'appui, ignoré ensuite jusqu'au relâchement.
+    private var pressIsMiddle = false
 
     /// Coupe/rétablit l'interception à chaud, sans démonter le tap ni
     /// perdre les autorisations déjà accordées. Si on désactive en pleine
-    /// fusion (bouton du milieu déjà simulé en cours), on la referme
-    /// proprement plutôt que de laisser le bouton "coincé" enfoncé.
+    /// session milieu verrouillée, on la referme proprement plutôt que de
+    /// laisser le bouton "coincé" enfoncé.
     var isEnabled = true {
         didSet {
             guard isEnabled != oldValue else { return }
             debugLog(isEnabled ? "🟢 activé" : "⚪️ désactivé")
-            if !isEnabled && middleActive {
+            if !isEnabled && pressLocked && pressIsMiddle {
                 endMiddle(at: lastLocation)
             }
+            pressLocked = false
         }
     }
 
     func start() {
-        touchGate.onGateOpen = { [weak self] in self?.gateDidOpen() }
-        touchGate.onGateClose = { [weak self] in self?.gateDidClose() }
         touchGate.start()
         startEventTap()
     }
@@ -61,8 +67,8 @@ final class MiddleClickEngine {
         }
         eventTap = nil
         runLoopSource = nil
-        realButtonDown = nil
-        middleActive = false
+        pressLocked = false
+        pressIsMiddle = false
     }
 
     /// Démonte puis recrée entièrement le tap et le portillon tactile.
@@ -141,10 +147,10 @@ final class MiddleClickEngine {
         lastLocation = event.location
 
         switch type {
-        case .leftMouseDown:  return handleDown(button: .left, event: event)
-        case .rightMouseDown: return handleDown(button: .right, event: event)
-        case .leftMouseUp:    return handleUp(button: .left, event: event)
-        case .rightMouseUp:   return handleUp(button: .right, event: event)
+        case .leftMouseDown, .rightMouseDown:
+            return handleDown(event: event)
+        case .leftMouseUp, .rightMouseUp:
+            return handleUp(event: event)
         case .leftMouseDragged, .rightMouseDragged:
             return handleDragged(event: event)
         default:
@@ -152,11 +158,14 @@ final class MiddleClickEngine {
         }
     }
 
-    private func handleDown(button: CGMouseButton, event: CGEvent) -> Unmanaged<CGEvent>? {
-        realButtonDown = button
+    private func handleDown(event: CGEvent) -> Unmanaged<CGEvent>? {
+        // Décision prise UNE SEULE FOIS, à l'instant précis de l'appui, puis
+        // verrouillée jusqu'au relâchement (voir handleUp).
+        pressLocked = true
+        pressIsMiddle = touchGate.isOpen
 
-        if touchGate.isOpen && !middleActive {
-            debugLog("🟢 portillon déjà ouvert au moment du clic -> fusion immédiate")
+        if pressIsMiddle {
+            debugLog("🟢 \(touchGate.currentCount) doigts posés à l'appui -> session verrouillée en clic milieu")
             beginMiddle(at: event.location)
             return nil
         }
@@ -165,57 +174,32 @@ final class MiddleClickEngine {
     }
 
     private func handleDragged(event: CGEvent) -> Unmanaged<CGEvent>? {
-        guard middleActive else {
+        guard pressLocked, pressIsMiddle else {
             return Unmanaged.passRetained(event)
         }
         sendMiddle(type: .otherMouseDragged, at: event.location)
         return nil
     }
 
-    private func handleUp(button: CGMouseButton, event: CGEvent) -> Unmanaged<CGEvent>? {
-        defer { realButtonDown = nil }
+    private func handleUp(event: CGEvent) -> Unmanaged<CGEvent>? {
+        defer { pressLocked = false }
 
-        if middleActive {
-            debugLog("🔴 relâchement bouton réel pendant fusion -> fin du clic milieu")
-            endMiddle(at: event.location)
-            return nil
+        guard pressIsMiddle else {
+            return Unmanaged.passRetained(event)
         }
 
-        return Unmanaged.passRetained(event)
-    }
-
-    // MARK: - Réactions au portillon tactile
-
-    private func gateDidOpen() {
-        guard isEnabled, !middleActive else { return }
-
-        if let button = realButtonDown {
-            // Un clic simple était déjà en cours : on le referme proprement
-            // avant de démarrer le clic milieu, au même endroit.
-            debugLog("🟠 portillon ouvert pendant un clic \(button == .left ? "gauche" : "droit") en cours -> hot-swap vers milieu")
-            let closeType: CGEventType = (button == .left) ? .leftMouseUp : .rightMouseUp
-            sendReal(type: closeType, button: button, at: lastLocation)
-            beginMiddle(at: lastLocation)
-        }
-        // Sinon : 2 doigts posés sans clic en cours, on ne fait rien tant
-        // qu'aucun mouseDown ne survient (voir handleDown).
-    }
-
-    private func gateDidClose() {
-        guard isEnabled, middleActive else { return }
-        debugLog("🔴 portillon refermé -> fin du clic milieu")
-        endMiddle(at: lastLocation)
+        debugLog("🔴 relâchement réel -> fin de la session milieu verrouillée")
+        endMiddle(at: event.location)
+        return nil
     }
 
     // MARK: - Émission des événements synthétiques
 
     private func beginMiddle(at point: CGPoint) {
-        middleActive = true
         sendMiddle(type: .otherMouseDown, at: point)
     }
 
     private func endMiddle(at point: CGPoint) {
-        middleActive = false
         sendMiddle(type: .otherMouseUp, at: point)
     }
 
@@ -227,19 +211,6 @@ final class MiddleClickEngine {
             mouseButton: .center
         ) else { return }
         event.setIntegerValueField(.mouseEventButtonNumber, value: 2)
-        tag(event)
-        event.post(tap: .cghidEventTap)
-    }
-
-    /// Ré-émet un vrai mouseUp gauche/droit synthétique (pour le hot-swap),
-    /// distinct du clic milieu.
-    private func sendReal(type: CGEventType, button: CGMouseButton, at point: CGPoint) {
-        guard let event = CGEvent(
-            mouseEventSource: nil,
-            mouseType: type,
-            mouseCursorPosition: point,
-            mouseButton: button
-        ) else { return }
         tag(event)
         event.post(tap: .cghidEventTap)
     }
