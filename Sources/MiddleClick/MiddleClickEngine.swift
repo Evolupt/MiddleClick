@@ -36,6 +36,8 @@ final class MiddleClickEngine {
     private var pressLocked = false
     /// Décidé une seule fois à l'appui, ignoré ensuite jusqu'au relâchement.
     private var pressIsMiddle = false
+    /// Pour ne logger le début d'un glissé qu'une fois, pas à chaque frame.
+    private var dragStarted = false
 
     /// Coupe/rétablit l'interception à chaud, sans démonter le tap ni
     /// perdre les autorisations déjà accordées. Si on désactive en pleine
@@ -147,48 +149,71 @@ final class MiddleClickEngine {
         lastLocation = event.location
 
         switch type {
-        case .leftMouseDown, .rightMouseDown:
-            return handleDown(event: event)
-        case .leftMouseUp, .rightMouseUp:
-            return handleUp(event: event)
-        case .leftMouseDragged, .rightMouseDragged:
-            return handleDragged(event: event)
+        case .leftMouseDown:
+            return handleDown(event: event, buttonLabel: "gauche")
+        case .rightMouseDown:
+            return handleDown(event: event, buttonLabel: "droit")
+        case .leftMouseUp:
+            return handleUp(event: event, buttonLabel: "gauche")
+        case .rightMouseUp:
+            return handleUp(event: event, buttonLabel: "droit")
+        case .leftMouseDragged:
+            return handleDragged(event: event, buttonLabel: "gauche")
+        case .rightMouseDragged:
+            return handleDragged(event: event, buttonLabel: "droit")
         default:
             return Unmanaged.passRetained(event)
         }
     }
 
-    private func handleDown(event: CGEvent) -> Unmanaged<CGEvent>? {
+    private func handleDown(event: CGEvent, buttonLabel: String) -> Unmanaged<CGEvent>? {
         // Décision prise UNE SEULE FOIS, à l'instant précis de l'appui, puis
         // verrouillée jusqu'au relâchement (voir handleUp).
         pressLocked = true
         pressIsMiddle = touchGate.isOpen
+        dragStarted = false
 
         if pressIsMiddle {
-            debugLog("🟢 \(touchGate.currentCount) doigts posés à l'appui -> session verrouillée en clic milieu")
+            debugLog("🟢 clic \(buttonLabel) (down) avec \(touchGate.currentCount) doigts posés -> verrouillé en clic MILIEU")
             beginMiddle(at: event.location)
             return nil
         }
 
+        debugLog("⬇️ clic \(buttonLabel) (down)")
         return Unmanaged.passRetained(event)
     }
 
-    private func handleDragged(event: CGEvent) -> Unmanaged<CGEvent>? {
+    private func handleDragged(event: CGEvent, buttonLabel: String) -> Unmanaged<CGEvent>? {
         guard pressLocked, pressIsMiddle else {
+            if !dragStarted {
+                dragStarted = true
+                debugLog("↔️ glissé \(buttonLabel) : début")
+            }
             return Unmanaged.passRetained(event)
+        }
+        if !dragStarted {
+            dragStarted = true
+            debugLog("↔️ glissé MILIEU (fusionné depuis \(buttonLabel)) : début")
         }
         sendMiddle(type: .otherMouseDragged, at: event.location)
         return nil
     }
 
-    private func handleUp(event: CGEvent) -> Unmanaged<CGEvent>? {
-        defer { pressLocked = false }
+    private func handleUp(event: CGEvent, buttonLabel: String) -> Unmanaged<CGEvent>? {
+        defer {
+            if dragStarted {
+                debugLog("⏹ glissé \(pressIsMiddle ? "MILIEU (fusionné)" : buttonLabel) : fin")
+            }
+            pressLocked = false
+            dragStarted = false
+        }
 
         guard pressIsMiddle else {
+            debugLog("⬆️ clic \(buttonLabel) (up)")
             return Unmanaged.passRetained(event)
         }
 
-        debugLog("🔴 relâchement réel -> fin de la session milieu verrouillée")
+        debugLog("🔴 clic \(buttonLabel) relâché -> fin de la session MILIEU verrouillée")
         endMiddle(at: event.location)
         return nil
     }
