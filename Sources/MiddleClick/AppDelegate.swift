@@ -11,7 +11,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// pour pouvoir refléter le toggle dans le menu même avant que le
     /// moteur n'existe (permissions pas encore accordées).
     private var isEnabled = true {
-        didSet { applyEnabledState() }
+        didSet {
+            applyEnabledState()
+            // Réactivation (désactivé -> activé) : on en profite pour
+            // redémarrer entièrement le moteur, pas juste reprendre le
+            // traitement des événements. Ça permet d'utiliser le
+            // désactiver/réactiver comme un vrai "reconnecter la souris" en
+            // cas de souci Bluetooth (déconnexion à la sortie de veille,
+            // etc.) sans avoir à quitter/relancer toute l'app.
+            guard isEnabled, !oldValue else { return }
+            debugLog("🔁 réactivation manuelle -> redémarrage du moteur (tap + portillon tactile)")
+            engine?.restart()
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -100,8 +111,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// réveil elle se reconnecte avec une nouvelle référence système, ce qui
     /// invalide silencieusement l'ancienne inscription tactile — le moteur
     /// reste "actif" en apparence mais ne reçoit plus rien. On redémarre
-    /// donc entièrement le moteur à chaque réveil, avec un court délai pour
-    /// laisser le temps au Bluetooth de se reconnecter.
+    /// donc le moteur au réveil, en 2 tentatives (2s puis 6s) puisque le
+    /// délai de reconnexion Bluetooth réel est variable et pas toujours
+    /// couvert par une seule tentative rapide.
     private func observeSystemWake() {
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
@@ -112,11 +124,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func systemDidWake() {
-        debugLog("💤➡️🟢 réveil système détecté, redémarrage programmé")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self = self, let engine = self.engine else { return }
-            engine.restart()
-            engine.isEnabled = self.isEnabled
+        debugLog("💤➡️🟢 réveil système détecté, redémarrages programmés (2s puis 6s)")
+        for delay in [2.0, 6.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self, let engine = self.engine else { return }
+                engine.restart()
+                engine.isEnabled = self.isEnabled
+            }
         }
     }
 
