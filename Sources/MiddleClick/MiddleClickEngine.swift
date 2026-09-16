@@ -16,11 +16,16 @@ import IOKit.hid
 ///   la durée de l'appui : les doigts peuvent ensuite se poser ou se lever
 ///   sans rien changer, jusqu'au relâchement réel du bouton.
 ///
-/// Ça évite deux problèmes symétriques rencontrés avec une version plus
-/// réactive : un doigt qui se pose par inadvertance en cours de glissement
-/// simple (annulait une sélection à tort), et un doigt qui se lève en cours
-/// de glissé milieu (coupait le drag milieu à tort — alors qu'on veut au
-/// contraire qu'il continue tant que le bouton physique reste enfoncé).
+/// Un seul `CGEventTap`, couvrant down/up/dragged pour les deux boutons.
+/// Une tentative de scinder les glissés dans un second tap
+/// (activé/désactivé dynamiquement uniquement pendant une session milieu,
+/// pour éviter d'intercepter les micro-`mouseDragged` générés par un simple
+/// clic mécanique) a cassé le drag milieu lui-même — non testable dans
+/// l'environnement où ce code est écrit, et le risque de régression sur la
+/// fonctionnalité principale l'emporte sur le gain. Retour donc à un seul
+/// tap, quitte à rouvrir la piste plus tard avec un diagnostic plus poussé
+/// si le souci d'interférence avec des applications tierces (ex. clic droit
+/// peu fiable dans un logiciel de montage) redevient prioritaire.
 final class MiddleClickEngine {
 
     private static let syntheticMarker: Int64 = 0x4D43 // "MC"
@@ -71,6 +76,7 @@ final class MiddleClickEngine {
         runLoopSource = nil
         pressLocked = false
         pressIsMiddle = false
+        dragStarted = false
     }
 
     /// Démonte puis recrée entièrement le tap et le portillon tactile.
@@ -109,7 +115,13 @@ final class MiddleClickEngine {
 
         guard let tap = CGEvent.tapCreate(
             tap: .cghidEventTap,
-            place: .headInsertEventTap,
+            // .tailAppendEventTap plutôt que .headInsertEventTap : test pour
+            // le souci de clic droit peu fiable dans Slider quand MiddleClick
+            // est actif (hypothèse : être en tout dernier dans la chaîne des
+            // taps, plutôt qu'en tout premier, change la donne pour une appli
+            // sensible à l'ordre de délivrance). Repasser à .headInsertEventTap
+            // si ça ne change rien ou si ça introduit un autre souci.
+            place: .tailAppendEventTap,
             options: .defaultTap,
             eventsOfInterest: mask,
             callback: { _, type, event, userInfo in
